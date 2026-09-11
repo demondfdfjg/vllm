@@ -26,6 +26,7 @@ from .admission import (
 )
 from .projector import CompactLMHeadCache, project_target_token_logits
 from .compact_sampler import compact_sample
+from .compact_sampler_mrv2 import compact_sample_mrv2
 
 __all__ = [
     "TargetTokenScoringState",
@@ -34,4 +35,5 @@ __all__ = [
     "CompactLMHeadCache",
     "project_target_token_logits",
     "compact_sample",
+    "compact_sample_mrv2",
 ]

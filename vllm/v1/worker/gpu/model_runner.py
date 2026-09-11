@@ -22,6 +22,7 @@ import gc
 import time
 from contextlib import AbstractContextManager
 from copy import deepcopy
+from types import SimpleNamespace
 from typing import Any, NamedTuple
 
 import numpy as np
@@ -77,6 +78,13 @@ from vllm.v1.outputs import (
     ECConnectorOutput,
     ModelRunnerOutput,
     RoutedExpertsTensors,
+)
+from vllm.v1.worker.target_token_scoring import (
+    CompactLMHeadCache,
+    TargetTokenScoringState,
+    compact_sample_mrv2,
+    evaluate_wave_admission,
+    project_target_token_logits,
 )
 from vllm.v1.watermarking import create_watermarker
 from vllm.v1.watermarking.gpu_sampler import GPUWatermarkSampler
@@ -350,6 +358,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # For transferring state from execute_model to subsequent sample_tokens call.
         self.execute_model_state: ExecuteModelState | None = None
+
+        # Target-token-scoring compact fast path (mrv2 port). The cache is
+        # per-runner so weight mutations on one runner cannot leak into another;
+        # ``_tts_sampling_params`` mirrors V1's ``self.requests`` so the wave
+        # admission gate can read each request's SamplingParams at sample()
+        # time (the mrv2 Sampler flattens SamplingParams into tensor sub-states
+        # and does not retain the raw object).
+        self._tts_cache: CompactLMHeadCache = CompactLMHeadCache()
+        self._tts_sampling_params: dict[str, Any] = {}
 
         # Expert parallelism load balancer.
         self.eplb = EPLBController(self.parallel_config, self.device)
@@ -1029,6 +1046,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.prompt_logprobs_worker is not None:
             self.prompt_logprobs_worker.remove_request(req_id)
         self.lora_state.remove_request(req_id)
+        self._tts_sampling_params.pop(req_id, None)
         return True
 
     def finish_requests(self, scheduler_output: SchedulerOutput) -> None:
@@ -1072,6 +1090,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
             prompt_len = new_req_data.prompt_len
             sampling_params = new_req_data.sampling_params
+            if sampling_params is not None:
+                self._tts_sampling_params[req_id] = sampling_params
             self.req_states.add_request(
                 req_id=req_id,
                 prompt_len=prompt_len,
@@ -1437,6 +1457,71 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         return block_tables, slot_mappings
 
+    def _resolve_lm_head(self) -> nn.Module | None:
+        """Resolve the LM head module for compact projection.
+
+        Most text-generation models expose ``self.lm_head``; VL/encoder
+        wrappers commonly delegate to ``self.language_model.lm_head``. Returns
+        ``None`` (native fallback) when neither pattern matches.
+        """
+        model = self.model
+        lm_head = getattr(model, "lm_head", None)
+        if lm_head is not None:
+            return lm_head
+        inner = getattr(model, "language_model", None)
+        if inner is not None:
+            return getattr(inner, "lm_head", None)
+        return None
+
+    def _maybe_target_token_scoring(
+        self,
+        sample_hidden_states: torch.Tensor,
+        input_batch: InputBatch,
+    ) -> tuple[torch.Tensor | None, TargetTokenScoringState | None]:
+        """Try the compact target-token-scoring fast path (mrv2 port).
+
+        Returns ``(compact_logits[B, K], state)`` when the wave is eligible,
+        else ``(None, None)`` and the caller runs the native path. Eligibility
+        is wave-level: any single failure downgrades the whole wave to native.
+
+        The mrv2 Sampler flattens ``SamplingParams`` into tensor sub-states and
+        does not retain the raw object, so the admission gate reads each
+        request's ``SamplingParams`` from ``self._tts_sampling_params`` (a
+        per-req registry populated in ``add_requests``) rather than from the
+        sampler.
+        """
+        if not self.model_config.target_token_scoring:
+            return None, None
+        if input_batch.num_reqs == 0:
+            return None, None
+        # Compact path only on the plain non-sharded, non-spec branch. The
+        # sharded path needs the full-vocab logits for the all-to-all, and the
+        # rejection-sampler path is spec decoding; both fall back to native.
+        if self.batch_sharder is not None or self.rejection_sampler is not None:
+            return None, None
+        lm_head = self._resolve_lm_head()
+        if lm_head is None:
+            return None, None
+        requests = {
+            rid: SimpleNamespace(sampling_params=self._tts_sampling_params.get(rid))
+            for rid in input_batch.req_ids
+        }
+        decision = evaluate_wave_admission(
+            self.model_config,
+            input_batch,
+            requests,
+            lm_head,
+            spec_decode_metadata=None,
+        )
+        if not decision.ok:
+            return None, None
+        result = project_target_token_logits(
+            self.model, sample_hidden_states, decision, self._tts_cache
+        )
+        if result is None:
+            return None, None
+        return result
+
     def sample(
         self,
         hidden_states: torch.Tensor,
@@ -1445,6 +1530,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
         shard_metadata = None
         global_input_batch = input_batch
+        # Compact target-token-scoring fast path. Only the plain (non-sharded,
+        # non-spec) branch can engage; the sharded/rejection-sampler branches
+        # keep the native sampler. ``tts_state`` is the carrier to the sampler
+        # branch below; ``None`` means "run the native path".
+        tts_logits: torch.Tensor | None = None
+        tts_state: TargetTokenScoringState | None = None
         if self.batch_sharder is not None:
             # Shard the inputs along the batch dimension to sample in parallel
             # across TP ranks.
@@ -1460,10 +1551,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             logits = logits[:, : self.vocab_size]
         else:
             sample_hidden_states = hidden_states[input_batch.logits_indices]
-            logits = self.model.compute_logits(sample_hidden_states)
+            tts_logits, tts_state = self._maybe_target_token_scoring(
+                sample_hidden_states, input_batch
+            )
+            if tts_logits is None:
+                logits = self.model.compute_logits(sample_hidden_states)
+            else:
+                # Skip the full-vocab MatMul; project only the K candidate rows.
+                logits = tts_logits
 
-        if grammar_output is not None:
-            # Apply grammar bitmask to the logits in-place.
+        if grammar_output is not None and tts_state is None:
+            # Apply grammar bitmask to the logits in-place. Guarded on
+            # ``tts_state is None``: the bitmask is vocab-shaped and must never
+            # touch the compact [B, K] tensor (admission rejects structured
+            # output, so this branch is dead when compact is active, but the
+            # guard makes that invariant explicit).
             assert self.structured_outputs_worker is not None
             self.structured_outputs_worker.apply_grammar_bitmask(
                 logits,
@@ -1477,6 +1579,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # This rank owns no requests this step. It contributes an
             # all-padding block to the gather below.
             sampler_output = None
+        elif tts_state is not None:
+            assert self.sampler is not None
+            sampler_output = compact_sample_mrv2(
+                tts_logits,
+                tts_state,
+                compute_nans=self.sampler.compute_nans,
+            )
         elif input_batch.num_draft_tokens == 0 or self.rejection_sampler is None:
             assert self.sampler is not None
             sampler_output = self.sampler(logits, input_batch)
